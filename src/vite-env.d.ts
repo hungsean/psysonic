@@ -3,6 +3,8 @@
 declare global {
   interface ImportMetaEnv {
     readonly VITE_PSYSONIC_FLATPAK?: string;
+    /** `1` skips the startup update check (self-built forks). */
+    readonly VITE_PSYSONIC_DISABLE_UPDATER?: string;
   }
 
   interface ImportMeta {

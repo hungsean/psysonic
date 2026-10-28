@@ -88,7 +88,13 @@ export function useAppUpdater() {
 
   useEffect(() => {
     let cancelled = false;
-    const timer = setTimeout(() => { if (!cancelled) fetchRelease(); }, 4000);
+    // Self-built forks set VITE_PSYSONIC_DISABLE_UPDATER=1 so the official
+    // release probe never offers to replace them. The manual preview event
+    // below stays available.
+    const autoCheck = import.meta.env.VITE_PSYSONIC_DISABLE_UPDATER !== '1';
+    const timer = autoCheck
+      ? setTimeout(() => { if (!cancelled) fetchRelease(); }, 4000)
+      : undefined;
 
     const handler = () => fetchRelease(true);
     window.addEventListener('psysonic:preview-update', handler);
