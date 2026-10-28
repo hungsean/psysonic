@@ -14,17 +14,12 @@
  * (no "save anyway" escape hatch — see spec §7.3).
  */
 
-import md5 from 'md5';
 import {
   apiWithCredentials,
-  restBaseFromUrl,
-  secureRandomSalt,
-  SUBSONIC_CLIENT,
   type ServerHttpHeaderProfile,
 } from '@/lib/api/subsonicClient';
 import type { ServerProfile } from '@/store/authStoreTypes';
 import { allNormalizedAddresses } from '@/lib/server/serverEndpoint';
-import { headersForServerRequest } from '@/lib/server/serverHttpHeaders';
 
 export type ServerFingerprint = {
   ping: {
@@ -54,7 +49,7 @@ export type VerifySameServerResult =
 //
 // `pingWithCredentials` in api/subsonic.ts drops the envelope `version`. We
 // need it for the fingerprint (informational, per spec §7.3) so we do the
-// ping call here against the same Subsonic shape. Failure → throws.
+// ping call here against the same Subsonic shape. Failure → `ok: false`.
 
 type PingFingerprint = ServerFingerprint['ping'] & { ok: boolean };
 
@@ -64,34 +59,22 @@ async function fetchPingFingerprint(
   password: string,
   headerProfile?: ServerHttpHeaderProfile,
 ): Promise<PingFingerprint> {
-  // Mirrors pingWithCredentials but also extracts envelope `version`.
-  // Using fetch (the bundled axios pulls in extra noise here; one call is fine).
-  const salt = secureRandomSalt();
-  const token = md5(password + salt);
-  const params = new URLSearchParams({
-    u: username,
-    t: token,
-    s: salt,
-    v: '1.16.1',
-    c: SUBSONIC_CLIENT,
-    f: 'json',
-  });
-  const url = `${restBaseFromUrl(baseUrl)}/ping.view?${params.toString()}`;
-  const profileForHeaders: ServerHttpHeaderProfile = headerProfile ?? {
-    url: baseUrl,
-    alternateUrl: undefined,
-    customHeaders: undefined,
-    customHeadersApplyTo: undefined,
-  };
-  let body: Record<string, unknown> | null;
+  // Goes through apiWithCredentials (not the WebView `fetch`) so gate-header
+  // servers (Cloudflare Access, Pangolin) take the native transport: a WebView
+  // request carrying those headers triggers a CORS preflight the gate rejects,
+  // and save would report the address as unreachable. The returned
+  // `subsonic-response` still carries the envelope `version`.
+  let body: Record<string, unknown>;
   try {
-    const resp = await fetch(url, {
-      method: 'GET',
-      headers: headersForServerRequest(profileForHeaders, baseUrl),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const json = (await resp.json()) as Record<string, unknown>;
-    body = (json?.['subsonic-response'] as Record<string, unknown>) ?? null;
+    body = await apiWithCredentials<Record<string, unknown>>(
+      baseUrl,
+      username,
+      password,
+      'ping.view',
+      {},
+      15000,
+      headerProfile,
+    );
   } catch {
     return {
       ok: false,
@@ -101,18 +84,8 @@ async function fetchPingFingerprint(
       apiVersion: null,
     };
   }
-  if (!body) {
-    return {
-      ok: false,
-      type: null,
-      serverVersion: null,
-      openSubsonic: false,
-      apiVersion: null,
-    };
-  }
-  const ok = body.status === 'ok';
   return {
-    ok,
+    ok: true,
     type: typeof body.type === 'string' ? body.type : null,
     serverVersion: typeof body.serverVersion === 'string' ? body.serverVersion : null,
     openSubsonic: body.openSubsonic === true,
