@@ -34,37 +34,45 @@ function makeFingerprint(overrides: Partial<ServerFingerprint> = {}): ServerFing
   };
 }
 
+// apiWithCredentials resolves to the unwrapped `subsonic-response` body.
 function navidromePingResponse() {
   return {
-    'subsonic-response': {
-      status: 'ok',
-      type: 'navidrome',
-      serverVersion: '0.55.0',
-      openSubsonic: true,
-      version: '1.16.1',
-    },
+    status: 'ok',
+    type: 'navidrome',
+    serverVersion: '0.55.0',
+    openSubsonic: true,
+    version: '1.16.1',
   };
 }
 
 function ampachePingResponse() {
   // Minimal Subsonic-shape — ampache doesn't always advertise openSubsonic etc.
   return {
-    'subsonic-response': {
-      status: 'ok',
-      type: 'ampache',
-      serverVersion: '6.0.0',
-      version: '1.13.0',
-    },
+    status: 'ok',
+    type: 'ampache',
+    serverVersion: '6.0.0',
+    version: '1.13.0',
   };
 }
 
-/** Build a fetch-API-shaped mock response without depending on the global `Response` polyfill. */
-function jsonResponse(body: unknown, ok = true, status = 200) {
-  return {
-    ok,
-    status,
-    json: async () => body,
-  } as unknown as Response;
+type EndpointRoutes = Partial<Record<string, unknown>>;
+
+/**
+ * Route apiWithCredentials by base URL + endpoint so parallel probes stay
+ * deterministic. A missing endpoint or an `Error` value rejects, like a server
+ * that doesn't implement the call.
+ */
+function routeApi(byUrl: Record<string, EndpointRoutes>) {
+  vi.mocked(apiWithCredentials).mockImplementation(async (baseUrl, _u, _p, endpoint) => {
+    const value = byUrl[baseUrl]?.[endpoint];
+    if (value === undefined) throw new Error('Not implemented');
+    if (value instanceof Error) throw value;
+    return value;
+  });
+}
+
+function endpointsCalled(): string[] {
+  return vi.mocked(apiWithCredentials).mock.calls.map(call => call[3]);
 }
 
 describe('compareFingerprints', () => {
@@ -154,21 +162,22 @@ describe('fetchServerFingerprint', () => {
   });
 
   it('returns a populated fingerprint for a Navidrome-shaped server', async () => {
-    vi.mocked(fetch).mockResolvedValue(
-      jsonResponse(navidromePingResponse()),
-    );
-    vi.mocked(apiWithCredentials)
-      .mockResolvedValueOnce({ musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] } })
-      .mockResolvedValueOnce({ user: { id: 'tester', username: 'tester' } })
-      .mockResolvedValueOnce({ license: { email: 'tester@example.com' } })
-      .mockResolvedValueOnce({
-        indexes: {
-          index: [
-            { name: 'A', artist: [{ id: 'a1' }, { id: 'a2' }] },
-            { name: 'B', artist: [{ id: 'b1' }] },
-          ],
+    routeApi({
+      'https://music.example.com': {
+        'ping.view': navidromePingResponse(),
+        'getMusicFolders.view': { musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] } },
+        'getUser.view': { user: { id: 'tester', username: 'tester' } },
+        'getLicense.view': { license: { email: 'tester@example.com' } },
+        'getIndexes.view': {
+          indexes: {
+            index: [
+              { name: 'A', artist: [{ id: 'a1' }, { id: 'a2' }] },
+              { name: 'B', artist: [{ id: 'b1' }] },
+            ],
+          },
         },
-      });
+      },
+    });
 
     const fp = await fetchServerFingerprint('https://music.example.com', 'tester', 'pw');
     expect(fp.ping.type).toBe('navidrome');
@@ -181,16 +190,45 @@ describe('fetchServerFingerprint', () => {
     expect(fp.indexesDigest).toMatch(/^letters:2\|/);
   });
 
+  it('pings through apiWithCredentials with the header profile, never the WebView fetch', async () => {
+    // Regression: a WebView `fetch` carrying Cloudflare Access headers sends an
+    // OPTIONS preflight the gate rejects, so save reported "Could not reach".
+    // apiWithCredentials picks the native transport when gate headers apply.
+    const profile = {
+      url: 'https://music.example.com',
+      alternateUrl: 'http://192.168.0.10:4533',
+      customHeaders: [{ name: 'CF-Access-Client-Id', value: 'id' }],
+      customHeadersApplyTo: 'public' as const,
+    };
+    routeApi({ 'https://music.example.com': { 'ping.view': navidromePingResponse() } });
+
+    await fetchServerFingerprint('https://music.example.com', 'tester', 'pw', profile);
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(apiWithCredentials).toHaveBeenCalledWith(
+      'https://music.example.com',
+      'tester',
+      'pw',
+      'ping.view',
+      {},
+      15000,
+      profile,
+    );
+  });
+
   it('extracts userId only when the server supplies an explicit id (no username fallback)', async () => {
     // Two servers return the same authenticated user but only one of them
     // surfaces a `user.id` — the username-only side must extract null so the
     // comparator skips the signal instead of comparing two unrelated strings.
-    vi.mocked(fetch).mockResolvedValue(jsonResponse(navidromePingResponse()));
-    vi.mocked(apiWithCredentials)
-      .mockResolvedValueOnce({ musicFolders: { musicFolder: [] } })
-      .mockResolvedValueOnce({ user: { username: 'tester' } }) // no `id` field
-      .mockResolvedValueOnce({})
-      .mockResolvedValueOnce({});
+    routeApi({
+      'https://x.example.com': {
+        'ping.view': navidromePingResponse(),
+        'getMusicFolders.view': { musicFolders: { musicFolder: [] } },
+        'getUser.view': { user: { username: 'tester' } }, // no `id` field
+        'getLicense.view': {},
+        'getIndexes.view': {},
+      },
+    });
     const fp = await fetchServerFingerprint('https://x.example.com', 'tester', 'pw');
     expect(fp.userId).toBeNull();
   });
@@ -201,12 +239,15 @@ describe('fetchServerFingerprint', () => {
     // fingerprint must surface what succeeded and leave the rest null —
     // guards against a Promise.all-vs-allSettled regression that would
     // collapse the whole fingerprint when one call throws.
-    vi.mocked(fetch).mockResolvedValue(jsonResponse(navidromePingResponse()));
-    vi.mocked(apiWithCredentials)
-      .mockResolvedValueOnce({ musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] } })
-      .mockResolvedValueOnce({ user: { id: 'tester' } })
-      .mockRejectedValueOnce(new Error('license not implemented'))
-      .mockRejectedValueOnce(new Error('indexes not implemented'));
+    routeApi({
+      'https://music.example.com': {
+        'ping.view': navidromePingResponse(),
+        'getMusicFolders.view': { musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] } },
+        'getUser.view': { user: { id: 'tester' } },
+        'getLicense.view': new Error('license not implemented'),
+        'getIndexes.view': new Error('indexes not implemented'),
+      },
+    });
     const fp = await fetchServerFingerprint('https://music.example.com', 'tester', 'pw');
     expect(fp.musicFolders).toEqual([{ id: '1', name: 'Music' }]);
     expect(fp.userId).toBe('tester');
@@ -215,11 +256,8 @@ describe('fetchServerFingerprint', () => {
   });
 
   it('soft-fails optional calls — minimal Subsonic-shape', async () => {
-    vi.mocked(fetch).mockResolvedValue(
-      jsonResponse(ampachePingResponse()),
-    );
     // All four optional calls fail (server doesn't support them).
-    vi.mocked(apiWithCredentials).mockRejectedValue(new Error('Not implemented'));
+    routeApi({ 'https://ampache.example.com': { 'ping.view': ampachePingResponse() } });
 
     const fp = await fetchServerFingerprint('https://ampache.example.com', 'u', 'p');
     expect(fp.ping.type).toBe('ampache');
@@ -232,14 +270,14 @@ describe('fetchServerFingerprint', () => {
   });
 
   it('returns a null-bodied fingerprint when ping itself fails', async () => {
-    vi.mocked(fetch).mockResolvedValue(jsonResponse(null, false, 500));
+    routeApi({ 'https://broken.example.com': { 'ping.view': new Error('HTTP 500') } });
     const fp = await fetchServerFingerprint('https://broken.example.com', 'u', 'p');
     expect(fp.ping.type).toBeNull();
     expect(fp.ping.serverVersion).toBeNull();
     expect(fp.musicFolders).toBeNull();
     expect(fp.userId).toBeNull();
     // Optional calls are skipped entirely once ping fails.
-    expect(apiWithCredentials).not.toHaveBeenCalled();
+    expect(endpointsCalled()).toEqual(['ping.view']);
   });
 });
 
@@ -256,17 +294,16 @@ describe('verifySameServerEndpoints', () => {
       'p',
     );
     expect(result).toEqual({ ok: true });
-    expect(fetch).not.toHaveBeenCalled();
+    expect(apiWithCredentials).not.toHaveBeenCalled();
   });
 
   it('returns ok:true when both endpoints fingerprint the same server', async () => {
     // Both pings succeed; both return identical Navidrome payloads.
-    vi.mocked(fetch).mockResolvedValue(
-      jsonResponse(navidromePingResponse()),
-    );
-    vi.mocked(apiWithCredentials).mockResolvedValue({
-      musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] },
-    });
+    const same = {
+      'ping.view': navidromePingResponse(),
+      'getMusicFolders.view': { musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] } },
+    };
+    routeApi({ 'https://music.example.com': same, 'http://192.168.0.10': same });
 
     const result = await verifySameServerEndpoints(
       {
@@ -279,11 +316,41 @@ describe('verifySameServerEndpoints', () => {
     expect(result).toEqual({ ok: true });
   });
 
+  it('verifies a gate-header profile without touching the WebView fetch', async () => {
+    // Public address behind Cloudflare Access + plain LAN address: both pings
+    // must go through apiWithCredentials with the full profile so the public
+    // one carries its service token over the native transport.
+    const same = {
+      'ping.view': navidromePingResponse(),
+      'getMusicFolders.view': { musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] } },
+    };
+    routeApi({ 'https://music.example.com': same, 'http://192.168.0.10:4533': same });
+    const profile = {
+      url: 'https://music.example.com',
+      alternateUrl: 'http://192.168.0.10:4533',
+      customHeaders: [
+        { name: 'CF-Access-Client-Id', value: 'id' },
+        { name: 'CF-Access-Client-Secret', value: 'secret' },
+      ],
+      customHeadersApplyTo: 'public' as const,
+    };
+
+    const result = await verifySameServerEndpoints(profile, 'u', 'p');
+
+    expect(result).toEqual({ ok: true });
+    expect(fetch).not.toHaveBeenCalled();
+    const pingCalls = vi
+      .mocked(apiWithCredentials)
+      .mock.calls.filter(call => call[3] === 'ping.view');
+    expect(pingCalls).toHaveLength(2);
+    for (const call of pingCalls) expect(call[6]).toBe(profile);
+  });
+
   it('returns unreachable when one endpoint ping fails', async () => {
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(jsonResponse(navidromePingResponse()))
-      .mockResolvedValueOnce(jsonResponse(null, false, 500));
-    vi.mocked(apiWithCredentials).mockResolvedValue({});
+    routeApi({
+      'https://music.example.com': { 'ping.view': navidromePingResponse() },
+      'http://192.168.0.10': { 'ping.view': new Error('HTTP 500') },
+    });
 
     const result = await verifySameServerEndpoints(
       {
@@ -301,23 +368,23 @@ describe('verifySameServerEndpoints', () => {
   });
 
   it('returns mismatch when fingerprints disagree on a body signal', async () => {
-    vi.mocked(fetch).mockResolvedValue(
-      jsonResponse(navidromePingResponse()),
-    );
     // Two different folder lists.
-    vi.mocked(apiWithCredentials)
-      .mockResolvedValueOnce({ musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] } })
-      .mockResolvedValueOnce({ user: { id: 'tester' } })
-      .mockResolvedValueOnce({ license: { email: 'a@e.com' } })
-      .mockResolvedValueOnce({
-        indexes: { index: [{ name: 'A', artist: [{ id: 'a1' }] }] },
-      })
-      .mockResolvedValueOnce({ musicFolders: { musicFolder: [{ id: '99', name: 'Other' }] } })
-      .mockResolvedValueOnce({ user: { id: 'tester' } })
-      .mockResolvedValueOnce({ license: { email: 'a@e.com' } })
-      .mockResolvedValueOnce({
-        indexes: { index: [{ name: 'A', artist: [{ id: 'a1' }] }] },
-      });
+    const shared = {
+      'ping.view': navidromePingResponse(),
+      'getUser.view': { user: { id: 'tester' } },
+      'getLicense.view': { license: { email: 'a@e.com' } },
+      'getIndexes.view': { indexes: { index: [{ name: 'A', artist: [{ id: 'a1' }] }] } },
+    };
+    routeApi({
+      'https://a.example.com': {
+        ...shared,
+        'getMusicFolders.view': { musicFolders: { musicFolder: [{ id: '1', name: 'Music' }] } },
+      },
+      'https://b.example.com': {
+        ...shared,
+        'getMusicFolders.view': { musicFolders: { musicFolder: [{ id: '99', name: 'Other' }] } },
+      },
+    });
 
     const result = await verifySameServerEndpoints(
       {
@@ -332,11 +399,11 @@ describe('verifySameServerEndpoints', () => {
   });
 
   it('returns insufficient when pings agree but no body signal is comparable', async () => {
-    vi.mocked(fetch).mockResolvedValue(
-      jsonResponse(ampachePingResponse()),
-    );
     // Both servers don't respond to any optional call.
-    vi.mocked(apiWithCredentials).mockRejectedValue(new Error('Not implemented'));
+    routeApi({
+      'https://ampache-1.example.com': { 'ping.view': ampachePingResponse() },
+      'https://ampache-2.example.com': { 'ping.view': ampachePingResponse() },
+    });
 
     const result = await verifySameServerEndpoints(
       {
