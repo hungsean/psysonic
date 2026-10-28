@@ -70,6 +70,8 @@ describe('useAppUpdater in-app install', () => {
     platform.IS_MACOS = false;
     platform.IS_WINDOWS = false;
     vi.stubEnv('VITE_PSYSONIC_FLATPAK', '');
+    // A developer's .env.local may set this; keep the default probe under test.
+    vi.stubEnv('VITE_PSYSONIC_DISABLE_UPDATER', '');
   });
 
   afterEach(() => {
@@ -187,5 +189,27 @@ describe('useAppUpdater in-app install', () => {
     expect(result.current.flatpakUpdateCommand).toBe(
       'flatpak update --user io.github.psysonic.psysonic//rc',
     );
+  });
+
+  it('probes GitHub releases on startup by default', async () => {
+    renderHook(() => useAppUpdater());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips the startup probe when VITE_PSYSONIC_DISABLE_UPDATER=1', async () => {
+    vi.stubEnv('VITE_PSYSONIC_DISABLE_UPDATER', '1');
+    const { result } = renderHook(() => useAppUpdater());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(result.current.release).toBeNull();
   });
 });
