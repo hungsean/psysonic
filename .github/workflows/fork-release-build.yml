@@ -1,0 +1,113 @@
+name: Fork Release Build
+
+# Fork 專用的打包流程：在 GitHub 發布 Release 時，自動打包 macOS 與 Windows
+# 安裝檔並上傳到該 Release。
+#
+# 跟上游 release.yml 的差異：
+# - 不需要 Apple 憑證、公證、Tauri updater 私鑰或 Cachix 等 secrets
+# - macOS 使用 ad-hoc 簽章（未公證），首次開啟需執行
+#     xattr -cr /Applications/Psysonic.app
+# - 設定 VITE_PSYSONIC_DISABLE_UPDATER=1，避免 fork 版被官方 release 的自動更新覆蓋
+#
+# 也可以從 Actions 頁面手動執行，替既有的 release tag 補打包。
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要打包的 release tag（該 Release 必須已存在）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-build-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    # 只在 fork 執行，日後若把這支檔案 PR 回上游也不會誤觸發
+    if: github.repository == 'hungsean/psysonic'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple Silicon)
+            os: macos-latest
+            rust_targets: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - name: macOS (Intel)
+            os: macos-latest
+            rust_targets: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+          - name: Windows (x64)
+            os: windows-latest
+            rust_targets: ""
+            # 只出 NSIS 安裝檔；MSI 需要額外的 WiX 版本同步，與上游做法一致
+            args: --bundles nsis
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: resolve release id
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_RELEASE_ID: ${{ github.event.release.id }}
+        run: |
+          set -euo pipefail
+          if [ -n "${EVENT_RELEASE_ID:-}" ]; then
+            ID="$EVENT_RELEASE_ID"
+          else
+            ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq .id)"
+          fi
+          if [ -z "$ID" ]; then
+            echo "::error::找不到 tag '${RELEASE_TAG}' 對應的 Release"
+            exit 1
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: setup node
+        uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: "npm"
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.args }}
+
+      - name: install npm dependencies
+        run: npm install
+
+      - name: build and upload to release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VITE_PSYSONIC_DISABLE_UPDATER: "1"
+          # 選填：有設定這兩個 repo secrets 才會啟用 Last.fm
+          VITE_LASTFM_API_KEY: ${{ secrets.VITE_LASTFM_API_KEY }}
+          VITE_LASTFM_API_SECRET: ${{ secrets.VITE_LASTFM_API_SECRET }}
+          # macOS ad-hoc 簽章；Windows 會忽略這個變數
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          releaseId: ${{ steps.release.outputs.id }}
+          args: ${{ matrix.args }}
+          includeUpdaterJson: false
